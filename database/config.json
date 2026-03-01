@@ -1,0 +1,13 @@
+{
+    "rollen": {
+        "leitungsebene": [],
+        "mitarbeiter": []
+    },
+    "kanaele": {
+        "panel": null,
+        "dokumentationen": null,
+        "urlaubsantraege": null,
+        "backup": null
+    },
+    "panel_nachricht_id": null
+}
