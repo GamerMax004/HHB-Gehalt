@@ -7,8 +7,8 @@ import asyncio
 import zipfile
 import io
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+from flask import Flask
+from threading import Thread
 
 ADMIN_USER_IDS = [
     1211683189186105434,  # GamerMax
@@ -31,21 +31,29 @@ BACKUP_DATEIEN = {
     "leave.json":   LEAVE_FILE,
 }
 
-class KeepAliveHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot laeuft!")
-    def log_message(self, format, *args):
-        pass
+# ─────────────────────────────────────────────
+#  Flask Keep-Alive (wie beim funktionierenden Bot)
+# ─────────────────────────────────────────────
+flask_app = Flask('')
+
+@flask_app.route('/')
+def home():
+    return "HHB-Gehalt Bot läuft!"
+
+@flask_app.route('/health')
+def health():
+    return {"status": "healthy", "bot": str(bot.user) if bot.user else "starting"}
 
 def keep_alive():
-    port = int(os.getenv("PORT", 8080))  # FIX: Render gibt PORT als Env-Variable vor
-    server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"[Keep Alive] HTTP-Server gestartet auf Port {port}")
+    port = int(os.getenv("PORT", 8080))
+    t = Thread(target=lambda: flask_app.run(host='0.0.0.0', port=port))
+    t.daemon = True
+    t.start()
+    print(f"[Keep Alive] Flask-Server gestartet auf Port {port}")
 
+# ─────────────────────────────────────────────
+#  Datenbank
+# ─────────────────────────────────────────────
 def load_json(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -76,6 +84,9 @@ def init_database():
             save_json(path, default)
             print(f"[DB] {path} erstellt.")
 
+# ─────────────────────────────────────────────
+#  Berechtigungen
+# ─────────────────────────────────────────────
 def ist_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
@@ -93,6 +104,9 @@ def ist_mitarbeiter(member: discord.Member) -> bool:
     ids = config.get("rollen", {}).get("mitarbeiter", [])
     return any(str(r.id) in ids for r in member.roles)
 
+# ─────────────────────────────────────────────
+#  Bot Setup
+# ─────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -110,6 +124,9 @@ bot.SALARY_FILE       = SALARY_FILE
 bot.LEAVE_FILE        = LEAVE_FILE
 bot.ADMIN_USER_IDS    = ADMIN_USER_IDS
 
+# ─────────────────────────────────────────────
+#  Backup
+# ─────────────────────────────────────────────
 async def backup_senden(kanal: discord.TextChannel):
     jetzt           = datetime.now(timezone.utc)
     guild           = kanal.guild
@@ -159,10 +176,12 @@ async def backup_task():
         except Exception as e:
             print(f"[Backup] Fehler: {e}")
 
+# ─────────────────────────────────────────────
+#  on_ready
+# ─────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"[Bot] Eingeloggt als {bot.user} (ID: {bot.user.id})")
-    # FIX: Extensions werden NACH dem Login geladen
     for ext in ("shift", "tickets", "gehalt"):
         try:
             await bot.load_extension(ext)
@@ -182,13 +201,11 @@ async def on_ready():
 @bot.tree.command(name="reload", description="Spielt ein Datenbank-Backup (ZIP) wieder ein (nur Admins)")
 @app_commands.describe(backup_zip="Die Backup-ZIP-Datei, die eingespielt werden soll")
 async def reload_backup(interaction: discord.Interaction, backup_zip: discord.Attachment):
-    # Berechtigungsprüfung
     if not ist_admin(interaction.user.id):
         return await interaction.response.send_message(
             "Fehler: `Administrator` benötigt!", ephemeral=True
         )
 
-    # Nur ZIP erlauben
     if not backup_zip.filename.endswith(".zip"):
         return await interaction.response.send_message(
             "Fehler: Bitte nur `.zip`-Dateien hochladen!", ephemeral=True
@@ -197,19 +214,16 @@ async def reload_backup(interaction: discord.Interaction, backup_zip: discord.At
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # ZIP herunterladen
         zip_bytes = await backup_zip.read()
         zip_buf   = io.BytesIO(zip_bytes)
 
-        eingespielt  = []
+        eingespielt   = []
         uebersprungen = []
         fehler        = []
 
         with zipfile.ZipFile(zip_buf, "r") as zf:
-            namen = zf.namelist()
-
-            for dateiname_in_zip in namen:
-                # Basis-Name ermitteln (z.B. "config_20240101_120000.json" → "config.json")
+            for dateiname_in_zip in zf.namelist():
+                # z.B. "config_20240101_120000.json" → "config.json"
                 basis = dateiname_in_zip.split("_")[0] + ".json"
 
                 if basis not in BACKUP_DATEIEN:
@@ -217,12 +231,9 @@ async def reload_backup(interaction: discord.Interaction, backup_zip: discord.At
                     continue
 
                 ziel_pfad = BACKUP_DATEIEN[basis]
-
                 try:
                     inhalt = zf.read(dateiname_in_zip)
-                    # JSON-Validierung
-                    json.loads(inhalt)
-                    # Sicherstellen, dass der Ordner existiert
+                    json.loads(inhalt)  # JSON-Validierung
                     os.makedirs(os.path.dirname(ziel_pfad), exist_ok=True)
                     with open(ziel_pfad, "wb") as f:
                         f.write(inhalt)
@@ -233,7 +244,6 @@ async def reload_backup(interaction: discord.Interaction, backup_zip: discord.At
                 except Exception as e:
                     fehler.append(f"`{dateiname_in_zip}` ({e})")
 
-        # Ergebnis-Embed
         jetzt = datetime.now(timezone.utc)
         embed = discord.Embed(color=discord.Color.from_rgb(44, 47, 51), timestamp=jetzt)
         if interaction.guild and interaction.guild.icon:
@@ -248,7 +258,7 @@ async def reload_backup(interaction: discord.Interaction, backup_zip: discord.At
             )
         if uebersprungen:
             embed.add_field(
-                name="__Übersprungen__ (unbekannte Dateien)",
+                name="__Übersprungen__",
                 value="\n".join(f"> ⚠️ `{d}`" for d in uebersprungen),
                 inline=False
             )
@@ -292,10 +302,9 @@ async def konfiguriere_rolle(interaction: discord.Interaction, stufe: app_comman
     embed = discord.Embed(color=discord.Color.from_rgb(44, 47, 51))
     if interaction.guild and interaction.guild.icon:
         embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url)
-    embed.title       = "Konfiguration gespeichert!"
-    embed.description = ""
-    embed.add_field(name="__Rolle__", value=f"> <:4748ticket:1477410582691840140> - {rolle.mention}", inline=False)
-    embed.add_field(name="__Berechtigung__", value=f"> <:7842privacy:1477410613415248004> - {stufe.name}", inline=False)
+    embed.title = "Konfiguration gespeichert!"
+    embed.add_field(name="__Rolle__",        value=f"> <:4748ticket:1477410582691840140> - {rolle.mention}", inline=False)
+    embed.add_field(name="__Berechtigung__", value=f"> <:7842privacy:1477410613415248004> - {stufe.name}",   inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @konfiguriere_group.command(name="kanal", description="Setzt einen Kanal für eine Funktion")
@@ -316,12 +325,11 @@ async def konfiguriere_kanal(interaction: discord.Interaction, funktion: app_com
     embed = discord.Embed(color=discord.Color.from_rgb(44, 47, 51))
     if interaction.guild and interaction.guild.icon:
         embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url)
-    embed.title       = "Konfiguration gespeichert!"
-    embed.description = ""
+    embed.title = "Konfiguration gespeichert!"
     if funktion.value == "backup":
-        embed.add_field(name="__Kanal__", value=f"> <:1041searchthreads:1477410555726659775> - {kanal.mention}", inline=False)
-        embed.add_field(name="__Funktion__", value=f"> <:1072automod:1477410557371089019> - {funktion.name}", inline=False)
-        embed.add_field(name="__Hinweis__", value="> Erstes automatisches Backup in **24 Stunden**. Alternativ kann für ein Backup auch folgender Befehl verwendet werden:\n> <:8586slashcommand:1477410626769915984> - </backup:1477401421950484693>", inline=False)
+        embed.add_field(name="__Kanal__",    value=f"> <:1041searchthreads:1477410555726659775> - {kanal.mention}", inline=False)
+        embed.add_field(name="__Funktion__", value=f"> <:1072automod:1477410557371089019> - {funktion.name}",       inline=False)
+        embed.add_field(name="__Hinweis__",  value="> Erstes automatisches Backup in **24 Stunden**. Alternativ: </backup:1477401421950484693>", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
     if funktion.value == "panel":
         from tickets import panel_embed_senden
@@ -329,6 +337,9 @@ async def konfiguriere_kanal(interaction: discord.Interaction, funktion: app_com
 
 bot.tree.add_command(konfiguriere_group)
 
+# ─────────────────────────────────────────────
+#  /backup  –  Manuelles Backup
+# ─────────────────────────────────────────────
 @bot.tree.command(name="backup", description="Sendet sofort ein Datenbank-Backup als ZIP (nur Admins)")
 async def backup_manuell(interaction: discord.Interaction):
     if not ist_admin(interaction.user.id):
@@ -355,11 +366,11 @@ async def backup_manuell(interaction: discord.Interaction):
 # ─────────────────────────────────────────────
 #  Start
 # ─────────────────────────────────────────────
-async def main():
+if __name__ == "__main__":
     init_database()
     keep_alive()
-    async with bot:
-        await bot.start(BOT_TOKEN)  # FIX: Extensions werden in on_ready geladen
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    if not BOT_TOKEN:
+        print("[FEHLER] DISCORD_TOKEN nicht gesetzt! Bitte in Render unter Environment Variables eintragen.")
+    else:
+        print("[Bot] Starte...")
+        bot.run(BOT_TOKEN)
