@@ -40,10 +40,11 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
         pass
 
 def keep_alive():
-    server = HTTPServer(("0.0.0.0", 8080), KeepAliveHandler)
+    port = int(os.getenv("PORT", 8080))  # FIX: Render gibt PORT als Env-Variable vor
+    server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print("[Keep Alive] HTTP-Server gestartet auf Port 8080")
+    print(f"[Keep Alive] HTTP-Server gestartet auf Port {port}")
 
 def load_json(path: str) -> dict:
     try:
@@ -161,6 +162,13 @@ async def backup_task():
 @bot.event
 async def on_ready():
     print(f"[Bot] Eingeloggt als {bot.user} (ID: {bot.user.id})")
+    # FIX: Extensions werden NACH dem Login geladen
+    for ext in ("shift", "tickets", "gehalt"):
+        try:
+            await bot.load_extension(ext)
+            print(f"[Bot] Extension '{ext}' geladen.")
+        except Exception as e:
+            print(f"[Bot] Fehler beim Laden von '{ext}': {e}")
     try:
         synced = await bot.tree.sync()
         print(f"[Bot] {len(synced)} Slash-Commands synchronisiert.")
@@ -168,6 +176,104 @@ async def on_ready():
         print(f"[Bot] Sync-Fehler: {e}")
     asyncio.create_task(backup_task())
 
+# ─────────────────────────────────────────────
+#  /reload  –  Backup-ZIP wieder einspielen
+# ─────────────────────────────────────────────
+@bot.tree.command(name="reload", description="Spielt ein Datenbank-Backup (ZIP) wieder ein (nur Admins)")
+@app_commands.describe(backup_zip="Die Backup-ZIP-Datei, die eingespielt werden soll")
+async def reload_backup(interaction: discord.Interaction, backup_zip: discord.Attachment):
+    # Berechtigungsprüfung
+    if not ist_admin(interaction.user.id):
+        return await interaction.response.send_message(
+            "Fehler: `Administrator` benötigt!", ephemeral=True
+        )
+
+    # Nur ZIP erlauben
+    if not backup_zip.filename.endswith(".zip"):
+        return await interaction.response.send_message(
+            "Fehler: Bitte nur `.zip`-Dateien hochladen!", ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        # ZIP herunterladen
+        zip_bytes = await backup_zip.read()
+        zip_buf   = io.BytesIO(zip_bytes)
+
+        eingespielt  = []
+        uebersprungen = []
+        fehler        = []
+
+        with zipfile.ZipFile(zip_buf, "r") as zf:
+            namen = zf.namelist()
+
+            for dateiname_in_zip in namen:
+                # Basis-Name ermitteln (z.B. "config_20240101_120000.json" → "config.json")
+                basis = dateiname_in_zip.split("_")[0] + ".json"
+
+                if basis not in BACKUP_DATEIEN:
+                    uebersprungen.append(dateiname_in_zip)
+                    continue
+
+                ziel_pfad = BACKUP_DATEIEN[basis]
+
+                try:
+                    inhalt = zf.read(dateiname_in_zip)
+                    # JSON-Validierung
+                    json.loads(inhalt)
+                    # Sicherstellen, dass der Ordner existiert
+                    os.makedirs(os.path.dirname(ziel_pfad), exist_ok=True)
+                    with open(ziel_pfad, "wb") as f:
+                        f.write(inhalt)
+                    eingespielt.append(f"`{basis}`")
+                    print(f"[Reload] {basis} wiederhergestellt aus {dateiname_in_zip}")
+                except json.JSONDecodeError:
+                    fehler.append(f"`{dateiname_in_zip}` (ungültiges JSON)")
+                except Exception as e:
+                    fehler.append(f"`{dateiname_in_zip}` ({e})")
+
+        # Ergebnis-Embed
+        jetzt = datetime.now(timezone.utc)
+        embed = discord.Embed(color=discord.Color.from_rgb(44, 47, 51), timestamp=jetzt)
+        if interaction.guild and interaction.guild.icon:
+            embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url)
+        embed.title = "Backup eingespielt!"
+
+        if eingespielt:
+            embed.add_field(
+                name="__Wiederhergestellt__",
+                value="\n".join(f"> <:2141file:1477410565285609562> - {d}" for d in eingespielt),
+                inline=False
+            )
+        if uebersprungen:
+            embed.add_field(
+                name="__Übersprungen__ (unbekannte Dateien)",
+                value="\n".join(f"> ⚠️ `{d}`" for d in uebersprungen),
+                inline=False
+            )
+        if fehler:
+            embed.add_field(
+                name="__Fehler__",
+                value="\n".join(f"> ❌ {d}" for d in fehler),
+                inline=False
+            )
+        if not eingespielt and not fehler:
+            embed.description = "⚠️ Keine bekannten Datenbankdateien in der ZIP gefunden."
+
+        embed.set_footer(text=f"ZIP: {backup_zip.filename}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except zipfile.BadZipFile:
+        await interaction.followup.send(
+            "Fehler: Die hochgeladene Datei ist keine gültige ZIP-Datei!", ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"Unbekannter Fehler: `{e}`", ephemeral=True)
+
+# ─────────────────────────────────────────────
+#  Konfigurationsgruppe
+# ─────────────────────────────────────────────
 konfiguriere_group = app_commands.Group(name="konfiguriere", description="Bot-Konfiguration (nur Admins)")
 
 @konfiguriere_group.command(name="rolle", description="Setzt eine Rolle für eine Sicherheitsstufe")
@@ -188,8 +294,8 @@ async def konfiguriere_rolle(interaction: discord.Interaction, stufe: app_comman
         embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url)
     embed.title       = "Konfiguration gespeichert!"
     embed.description = ""
-    embed.add_field(name="__Rolle__", value=f"> <:4748ticket:1477410582691840140> - {rolle.mention}",inline=False)
-    embed.add_field(name="__Berechtigung__", value=f"> <:7842privacy:1477410613415248004> - {stufe.name}",inline=False)
+    embed.add_field(name="__Rolle__", value=f"> <:4748ticket:1477410582691840140> - {rolle.mention}", inline=False)
+    embed.add_field(name="__Berechtigung__", value=f"> <:7842privacy:1477410613415248004> - {stufe.name}", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @konfiguriere_group.command(name="kanal", description="Setzt einen Kanal für eine Funktion")
@@ -211,7 +317,7 @@ async def konfiguriere_kanal(interaction: discord.Interaction, funktion: app_com
     if interaction.guild and interaction.guild.icon:
         embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url)
     embed.title       = "Konfiguration gespeichert!"
-    embed.description = f""
+    embed.description = ""
     if funktion.value == "backup":
         embed.add_field(name="__Kanal__", value=f"> <:1041searchthreads:1477410555726659775> - {kanal.mention}", inline=False)
         embed.add_field(name="__Funktion__", value=f"> <:1072automod:1477410557371089019> - {funktion.name}", inline=False)
@@ -246,23 +352,14 @@ async def backup_manuell(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Fehler: `{e}`", ephemeral=True)
 
-async def extensions_laden():
-    # Verzögerter Start zur CPU-Schonung
-    print("[Bot] Verzögere Start um 10 Sekunden...")
-    await asyncio.sleep(10)
-    await bot.load_extension("shift")
-    await asyncio.sleep(2)
-    await bot.load_extension("tickets")
-    await asyncio.sleep(2)
-    await bot.load_extension("gehalt")
-    print("[Bot] Alle Erweiterungen geladen.")
-
+# ─────────────────────────────────────────────
+#  Start
+# ─────────────────────────────────────────────
 async def main():
     init_database()
     keep_alive()
     async with bot:
-        await extensions_laden()
-        await bot.start(BOT_TOKEN)
+        await bot.start(BOT_TOKEN)  # FIX: Extensions werden in on_ready geladen
 
 if __name__ == "__main__":
     asyncio.run(main())
